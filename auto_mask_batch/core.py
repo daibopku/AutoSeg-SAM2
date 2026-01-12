@@ -2,8 +2,8 @@
 
 This module wraps the original script logic from ``auto-mask-batch.py`` so it can be
 imported and called from other projects.  The main entrypoint is
-:func:`run_auto_mask_batch`, which returns the ``video_segments`` mapping used by
-the original script.
+:func:`run_auto_mask_batch`, which returns a dense ``(F, H, W)`` mask volume and
+writes a colorized mask mp4 for convenience.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -271,6 +271,73 @@ def cal_no_mask_area_ratio(out_mask_list: List[np.ndarray]):
     return mask_none.sum() / (h * w)
 
 
+def extract_video_frames(video_path: str, dst_dir: str) -> Tuple[List[str], float, Tuple[int, int]]:
+    """Extract frames from a video file into ``dst_dir`` as JPEGs.
+
+    Returns the list of generated frame filenames (zero-padded), the source fps,
+    and (height, width) of the frames.
+    """
+
+    os.makedirs(dst_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video file: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_names: List[str] = []
+    idx = 0
+    success, frame = cap.read()
+    if not success:
+        cap.release()
+        raise RuntimeError(f"No frames could be read from video: {video_path}")
+
+    height, width = frame.shape[:2]
+    while success:
+        fname = f"{idx:05}.jpg"
+        cv2.imwrite(os.path.join(dst_dir, fname), frame)
+        frame_names.append(fname)
+        idx += 1
+        success, frame = cap.read()
+
+    cap.release()
+    return frame_names, float(fps), (height, width)
+
+
+def masks_to_color_palette(max_id: int) -> np.ndarray:
+    """Build an RGB palette (0-1 float) where index maps to object id.
+
+    Index 0 is black (background).
+    """
+
+    palette = np.zeros((max_id + 1, 3), dtype=np.float32)
+    if max_id == 0:
+        return palette
+
+    cmap = plt.get_cmap("tab20")
+    for obj_id in range(1, max_id + 1):
+        palette[obj_id] = cmap(obj_id % cmap.N)[:3]
+    return palette
+
+
+def mask_frame_to_rgb(mask_frame: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    rgb = (palette[mask_frame] * 255).astype(np.uint8)
+    return rgb
+
+
+def ensure_2d_mask(mask: np.ndarray) -> np.ndarray:
+    """Ensure mask is a 2D boolean array.
+
+    Accepts shapes (H, W) or (1, H, W). Raises if shape is unexpected.
+    """
+
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim == 3 and mask_arr.shape[0] == 1:
+        mask_arr = np.squeeze(mask_arr, axis=0)
+    if mask_arr.ndim != 2:
+        raise ValueError(f"Mask must be 2D or (1,H,W); got shape {mask_arr.shape}")
+    return mask_arr.astype(bool)
+
+
 class Prompts:
     def __init__(self, bs: int):
         self.batch_size = bs
@@ -378,14 +445,15 @@ class AutoMaskBatchConfig:
 VideoSegments = Dict[int, Dict[int, np.ndarray]]
 
 
-def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
-    """Run the auto-mask-batch pipeline and return ``video_segments``.
+def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
+    """Run the auto-mask-batch pipeline and return a dense mask volume.
 
     Args:
         config: Runtime options for the pipeline.
 
     Returns:
-        Mapping of frame index -> {object id -> boolean mask numpy array}.
+        A numpy array of shape ``(F, H, W)`` where each value is the object id
+        (0 is background, objects start from 1).
     """
 
     device_type = "cuda" if config.device.startswith("cuda") else "cpu"
@@ -407,6 +475,32 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
     video_segments: VideoSegments = {}
     mask_ratio_thresh = 0.0
 
+    # Prepare frames from either a directory of JPGs or a video file (mp4, etc.).
+    frames_root = config.video_path
+    fps: float = 30.0
+    frame_names: List[str] = []
+    frame_height: int
+    frame_width: int
+
+    if os.path.isdir(config.video_path):
+        frame_names = [
+            p
+            for p in os.listdir(config.video_path)
+            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        ]
+        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        if not frame_names:
+            raise RuntimeError(f"No JPEG frames found in directory: {config.video_path}")
+        sample_img = cv2.imread(os.path.join(config.video_path, frame_names[0]))
+        if sample_img is None:
+            raise RuntimeError(f"Failed to read sample frame: {frame_names[0]}")
+        frame_height, frame_width = sample_img.shape[:2]
+    else:
+        frames_root = os.path.join(config.output_dir, config.level, "_frames_tmp")
+        frame_names, fps, (frame_height, frame_width) = extract_video_frames(config.video_path, frames_root)
+
+    num_frames = len(frame_names)
+
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
         predictor = build_sam2_video_predictor(config.sam2_config, config.sam2_checkpoint)
         sam = sam_model_registry["vit_h"](checkpoint=config.sam1_checkpoint).to(config.device)
@@ -421,14 +515,7 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
             min_mask_region_area=100,
         )
 
-        frame_names = [
-            p
-            for p in os.listdir(config.video_path)
-            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-        ]
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-
-        inference_state = predictor.init_state(video_path=config.video_path)
+        inference_state = predictor.init_state(video_path=frames_root)
         masks_from_prev: List[np.ndarray] = []
         now_frame = 0
         prompts_loader = Prompts(bs=config.batch_size)
@@ -436,7 +523,7 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
         while True:
             logger.info(f"frame: {now_frame}")
             sum_id = prompts_loader.get_obj_num()
-            image_path = os.path.join(config.video_path, frame_names[now_frame])
+            image_path = os.path.join(frames_root, frame_names[now_frame])
             image = cv2.imread(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             try:
@@ -521,7 +608,7 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
                 if config.save_outputs:
                     fig, ax = plt.subplots(figsize=(6, 4))
                     ax.set_title(f"frame {out_frame_idx}")
-                    img_path = os.path.join(config.video_path, frame_names[out_frame_idx])
+                    img_path = os.path.join(frames_root, frame_names[out_frame_idx])
                     ax.imshow(Image.open(img_path))
                     for out_obj_id, out_mask in video_segments[out_frame_idx].items():
                         show_mask(out_mask, ax, obj_id=out_obj_id, random_color=False)
@@ -552,7 +639,35 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> VideoSegments:
                 save_masks(out_mask_list, out_frame_idx, final_save_dir)
                 save_masks_npy(out_mask_list, out_frame_idx, final_save_dir)
 
-    return video_segments
+    # Build dense mask volume (F, H, W) with background=0 and object ids starting at 1.
+    mask_volume = np.zeros((num_frames, frame_height, frame_width), dtype=np.int32)
+    max_obj_id = 0
+    for frame_idx, objs in video_segments.items():
+        for obj_id, mask in objs.items():
+            target_id = obj_id + 1  # shift by 1 so background stays 0
+            mask_2d = ensure_2d_mask(mask)
+            if mask_2d.shape != (frame_height, frame_width):
+                mask_2d = cv2.resize(mask_2d.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST).astype(bool)
+            mask_volume[frame_idx][mask_2d] = target_id
+            max_obj_id = max(max_obj_id, target_id)
+
+    # Save a colored mask video to output_dir.
+    palette = masks_to_color_palette(max_obj_id)
+    mask_video_path = os.path.join(config.output_dir, config.level, "masks.mp4")
+    os.makedirs(os.path.dirname(mask_video_path), exist_ok=True)
+    writer = cv2.VideoWriter(
+        mask_video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (frame_width, frame_height),
+    )
+    for frame_idx in range(num_frames):
+        color_frame = mask_frame_to_rgb(mask_volume[frame_idx], palette)
+        writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+    logger.info(f"colored mask video saved to: {mask_video_path}")
+
+    return mask_volume
 
 
 __all__ = ["AutoMaskBatchConfig", "run_auto_mask_batch", "VideoSegments"]
