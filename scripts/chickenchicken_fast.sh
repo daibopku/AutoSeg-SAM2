@@ -15,15 +15,15 @@ for level in 'large'; do
 
     echo "auto-mask-batch.py execution time: ${auto_mask_elapsed_time} seconds"
 
-    visulization_start_time=$(date +%s)
-    python visulization.py \
-        --video_path videos/chickenchicken \
-        --output_dir output/chickenchicken \
-        --level ${level}
-    visulization_end_time=$(date +%s)
-    visulization_elapsed_time=$((visulization_end_time - visulization_start_time))
+    # visulization_start_time=$(date +%s)
+    # python visulization.py \
+    #     --video_path videos/chickenchicken \
+    #     --output_dir output/chickenchicken \
+    #     --level ${level}
+    # visulization_end_time=$(date +%s)
+    # visulization_elapsed_time=$((visulization_end_time - visulization_start_time))
 
-    echo "visulization.py execution time: ${visulization_elapsed_time} seconds"
+    # echo "visulization.py execution time: ${visulization_elapsed_time} seconds"
 
 done
 
