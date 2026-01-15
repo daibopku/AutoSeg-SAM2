@@ -7,21 +7,20 @@ name = "auto-mask-batch"
 version = "0.1.0"
 description = "Importable auto mask batch pipeline (SAM2 wrapper)"
 readme = "auto_mask_batch/README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
   { name = "AutoSeg-SAM2 maintainers" }
 ]
 license = { file = "LICENSE" }
 dependencies = [
-  "python>=3.10",
   "torch>=2.3.1",
   "torchvision>=0.18.1",
-  "segment-anything-1 @ file:submodule/segment-anything-1",
-  "segment-anything-2 @ file:submodule/segment-anything-2",
+  "segment-anything @ file:submodule/segment-anything-1",
+  "sam-2 @ file:submodule/segment-anything-2",
 ]
 
 [project.urls]
-Homepage = "https://github.com/zrporz/AutoSeg-SAM2"
+Homepage = "https://github.com/daibopku/AutoSeg-SAM2"
 
 [tool.setuptools.packages.find]
 include = ["auto_mask_batch", "auto_mask_batch.*", "sam2", "sam2.*", "sam2_configs", "sam2_configs.*"]

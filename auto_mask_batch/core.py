@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
@@ -23,6 +24,13 @@ from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from tqdm import tqdm
 
 from sam2.build_sam import build_sam2_video_predictor
+
+
+MODULE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = MODULE_DIR.parent
+DEFAULT_SAM2_CKPT = str(PROJECT_ROOT / "checkpoints" / "sam2" / "sam2_hiera_large.pt")
+DEFAULT_SAM2_CONFIG = str(PROJECT_ROOT / "sam2_configs" / "sam2_hiera_l.yaml")
+DEFAULT_SAM1_CKPT = str(PROJECT_ROOT / "checkpoints" / "sam1" / "sam_vit_h_4b8939.pth")
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +440,9 @@ class AutoMaskBatchConfig:
     pred_iou_thresh: float = 0.7
     box_nms_thresh: float = 0.7
     stability_score_thresh: float = 0.85
-    sam2_checkpoint: str = "./checkpoints/sam2/sam2_hiera_large.pt"
-    sam2_config: str = "sam2_hiera_l.yaml"
-    sam1_checkpoint: str = "checkpoints/sam1/sam_vit_h_4b8939.pth"
+    sam2_checkpoint: str = DEFAULT_SAM2_CKPT
+    sam2_config: str = DEFAULT_SAM2_CONFIG
+    sam1_checkpoint: str = DEFAULT_SAM1_CKPT
     device: str = "cuda"
     log_path: Optional[str] = None
     save_outputs: bool = True
@@ -502,7 +510,22 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
     num_frames = len(frame_names)
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        predictor = build_sam2_video_predictor(config.sam2_config, config.sam2_checkpoint)
+        # Allow both package-relative config names (e.g., "configs/sam2/sam2_hiera_l.yaml")
+        # and filesystem paths relative to this module. If a real file path is given,
+        # add its directory to Hydra's search path so compose() can find it.
+        sam2_config = config.sam2_config
+        hydra_overrides_extra: List[str] = []
+        cfg_path = Path(sam2_config).resolve()
+        if cfg_path.is_file():
+            hydra_overrides_extra.append(f"hydra.searchpath=[file://{cfg_path.parent}]")
+            sam2_config = cfg_path.name
+
+        predictor = build_sam2_video_predictor(
+            sam2_config,
+            config.sam2_checkpoint,
+            hydra_overrides_extra=hydra_overrides_extra,
+            device=config.device,
+        )
         sam = sam_model_registry["vit_h"](checkpoint=config.sam1_checkpoint).to(config.device)
         mask_generator = SamAutomaticMaskGenerator(
             model=sam,
@@ -666,6 +689,10 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
         writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
     writer.release()
     logger.info(f"colored mask video saved to: {mask_video_path}")
+    
+    npz_path = os.path.join(config.output_dir, config.level, "mask.npz")
+    np.savez_compressed(npz_path, mask_volume=mask_volume)
+    logger.info(f"mask volume saved to: {npz_path}")
 
     return mask_volume
 
