@@ -675,24 +675,25 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             max_obj_id = max(max_obj_id, target_id)
 
     # Save a colored mask video to output_dir.
-    palette = masks_to_color_palette(max_obj_id)
-    mask_video_path = os.path.join(config.output_dir, config.level, "masks.mp4")
-    os.makedirs(os.path.dirname(mask_video_path), exist_ok=True)
-    writer = cv2.VideoWriter(
-        mask_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (frame_width, frame_height),
-    )
-    for frame_idx in range(num_frames):
-        color_frame = mask_frame_to_rgb(mask_volume[frame_idx], palette)
-        writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
-    writer.release()
-    logger.info(f"colored mask video saved to: {mask_video_path}")
-    
-    npz_path = os.path.join(config.output_dir, config.level, "mask.npz")
-    np.savez_compressed(npz_path, mask_volume=mask_volume)
-    logger.info(f"mask volume saved to: {npz_path}")
+    if config.save_outputs:
+        palette = masks_to_color_palette(max_obj_id)
+        mask_video_path = os.path.join(config.output_dir, config.level, "masks.mp4")
+        os.makedirs(os.path.dirname(mask_video_path), exist_ok=True)
+        writer = cv2.VideoWriter(
+            mask_video_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (frame_width, frame_height),
+        )
+        for frame_idx in range(num_frames):
+            color_frame = mask_frame_to_rgb(mask_volume[frame_idx], palette)
+            writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        logger.info(f"colored mask video saved to: {mask_video_path}")
+        
+        npz_path = os.path.join(config.output_dir, config.level, "mask.npz")
+        np.savez_compressed(npz_path, mask_volume=mask_volume)
+        logger.info(f"mask volume saved to: {npz_path}")
 
     return mask_volume
 
