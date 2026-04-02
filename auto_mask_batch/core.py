@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -61,13 +62,23 @@ def show_anns(anns, borders: bool = True):
             contours, _ = cv2.findContours(
                 m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
-            contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
+            contours = [
+                cv2.approxPolyDP(contour, epsilon=0.01, closed=True)
+                for contour in contours
+            ]
             cv2.drawContours(img, contours, -1, (0, 0, 1, 0.4), thickness=1)
 
     ax.imshow(img)
 
 
-def mask_nms(masks: torch.Tensor, scores: torch.Tensor, iou_thr: float = 0.7, score_thr: float = 0.1, inner_thr: float = 0.2, **kwargs) -> torch.Tensor:
+def mask_nms(
+    masks: torch.Tensor,
+    scores: torch.Tensor,
+    iou_thr: float = 0.7,
+    score_thr: float = 0.1,
+    inner_thr: float = 0.2,
+    **kwargs,
+) -> torch.Tensor:
     scores, idx = scores.sort(0, descending=True)
     num_masks = idx.shape[0]
 
@@ -75,20 +86,36 @@ def mask_nms(masks: torch.Tensor, scores: torch.Tensor, iou_thr: float = 0.7, sc
     masks_area = torch.sum(masks_ord, dim=(1, 2), dtype=torch.float)
 
     iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    inner_iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
+    inner_iou_matrix = torch.zeros(
+        (num_masks,) * 2, dtype=torch.float, device=masks.device
+    )
 
     for i in range(num_masks):
         for j in range(i, num_masks):
-            intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
+            intersection = torch.sum(
+                torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float
+            )
+            union = torch.sum(
+                torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float
+            )
             iou = intersection / union
             iou_matrix[i, j] = iou
-            if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+            if (
+                intersection / masks_area[i] < 0.5
+                and intersection / masks_area[j] >= 0.85
+            ):
+                inner_iou = 1 - (intersection / masks_area[j]) * (
+                    intersection / masks_area[i]
+                )
                 inner_iou_matrix[i, j] = inner_iou
 
-            if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
+            if (
+                intersection / masks_area[i] >= 0.85
+                and intersection / masks_area[j] < 0.5
+            ):
+                inner_iou = 1 - (intersection / masks_area[j]) * (
+                    intersection / masks_area[i]
+                )
                 inner_iou_matrix[j, i] = inner_iou
 
     iou_matrix.triu_(diagonal=1)
@@ -132,9 +159,15 @@ def filter_masks(keep: torch.Tensor, masks_result: Iterable[dict]):
 def masks_update(*args, **kwargs):
     masks_new = ()
     for masks_lvl in args:
-        seg_pred = torch.from_numpy(np.stack([m["segmentation"] for m in masks_lvl], axis=0))
-        iou_pred = torch.from_numpy(np.stack([m["predicted_iou"] for m in masks_lvl], axis=0))
-        stability = torch.from_numpy(np.stack([m["stability_score"] for m in masks_lvl], axis=0))
+        seg_pred = torch.from_numpy(
+            np.stack([m["segmentation"] for m in masks_lvl], axis=0)
+        )
+        iou_pred = torch.from_numpy(
+            np.stack([m["predicted_iou"] for m in masks_lvl], axis=0)
+        )
+        stability = torch.from_numpy(
+            np.stack([m["stability_score"] for m in masks_lvl], axis=0)
+        )
 
         scores = stability * iou_pred
         keep_mask_nms = mask_nms(seg_pred, scores, **kwargs)
@@ -184,14 +217,33 @@ def save_masks_npy(mask_list: List[np.ndarray], frame_idx: int, save_dir: str):
 def show_points(coords, labels, ax, marker_size: int = 200):
     pos_points = coords[labels == 1]
     neg_points = coords[labels == 0]
-    ax.scatter(pos_points[:, 0], pos_points[:, 1], color="green", marker="*", s=marker_size, edgecolor="white", linewidth=1.25)
-    ax.scatter(neg_points[:, 0], neg_points[:, 1], color="red", marker="*", s=marker_size, edgecolor="white", linewidth=1.25)
+    ax.scatter(
+        pos_points[:, 0],
+        pos_points[:, 1],
+        color="green",
+        marker="*",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
+    )
+    ax.scatter(
+        neg_points[:, 0],
+        neg_points[:, 1],
+        color="red",
+        marker="*",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
+    )
 
 
 def make_enlarge_bbox(origin_bbox, max_width, max_height, ratio):
     width = origin_bbox[2]
     height = origin_bbox[3]
-    new_box = [max(origin_bbox[0] - width * (ratio - 1) / 2, 0), max(origin_bbox[1] - height * (ratio - 1) / 2, 0)]
+    new_box = [
+        max(origin_bbox[0] - width * (ratio - 1) / 2, 0),
+        max(origin_bbox[1] - height * (ratio - 1) / 2, 0),
+    ]
     new_box.append(min(width * ratio, max_width - new_box[0]))
     new_box.append(min(height * ratio, max_height - new_box[1]))
     return new_box
@@ -226,7 +278,14 @@ def sample_points_from_mask(mask):
     return tuple(sample_point)
 
 
-def search_new_obj(masks_from_prev, mask_list, other_masks_list=None, mask_ratio_thresh=0, ratio=0.5, area_threash=5000):
+def search_new_obj(
+    masks_from_prev,
+    mask_list,
+    other_masks_list=None,
+    mask_ratio_thresh=0,
+    ratio=0.5,
+    area_threash=5000,
+):
     new_mask_list = []
 
     mask_none = ~masks_from_prev[0].copy()[0]
@@ -241,13 +300,20 @@ def search_new_obj(masks_from_prev, mask_list, other_masks_list=None, mask_ratio
     for mask in new_mask_list:
         mask_none &= ~mask["segmentation"]
     logger.info(len(new_mask_list))
-    logger.info("now ratio:", mask_none.sum() / (mask_none.shape[0] * mask_none.shape[1]))
+    logger.info(
+        "now ratio:", mask_none.sum() / (mask_none.shape[0] * mask_none.shape[1])
+    )
     logger.info("expected ratios:", mask_ratio_thresh)
     if other_masks_list is not None:
         for mask in other_masks_list:
-            if mask_none.sum() / (mask_none.shape[0] * mask_none.shape[1]) > mask_ratio_thresh:
+            if (
+                mask_none.sum() / (mask_none.shape[0] * mask_none.shape[1])
+                > mask_ratio_thresh
+            ):
                 seg = mask["segmentation"]
-                if (mask_none & seg).sum() / seg.sum() > ratio and seg.sum() > area_threash:
+                if (
+                    mask_none & seg
+                ).sum() / seg.sum() > ratio and seg.sum() > area_threash:
                     new_mask_list.append(mask)
                     mask_none &= ~seg
             else:
@@ -279,7 +345,9 @@ def cal_no_mask_area_ratio(out_mask_list: List[np.ndarray]):
     return mask_none.sum() / (h * w)
 
 
-def extract_video_frames(video_path: str, dst_dir: str) -> Tuple[List[str], float, Tuple[int, int]]:
+def extract_video_frames(
+    video_path: str, dst_dir: str
+) -> Tuple[List[str], float, Tuple[int, int]]:
     """Extract frames from a video file into ``dst_dir`` as JPEGs.
 
     Returns the list of generated frame filenames (zero-padded), the source fps,
@@ -385,41 +453,57 @@ class Prompts:
             if self.iter_frameindex == len(self.key_frame_list) - 1:
                 end_idx = min(self.start_idx + self.batch_size, len(self.obj_list))
             else:
-                if self.start_idx + self.batch_size < self.key_frame_obj_begin_list[self.iter_frameindex + 1]:
+                if (
+                    self.start_idx + self.batch_size
+                    < self.key_frame_obj_begin_list[self.iter_frameindex + 1]
+                ):
                     end_idx = self.start_idx + self.batch_size
                 else:
                     end_idx = self.key_frame_obj_begin_list[self.iter_frameindex + 1]
                     self.iter_frameindex += 1
-            batch_keys = self.obj_list[self.start_idx:end_idx]
+            batch_keys = self.obj_list[self.start_idx : end_idx]
             batch_prompts = {key: self.prompts[key] for key in batch_keys}
             self.start_idx = end_idx
             return batch_prompts
         raise StopIteration
 
 
-def get_video_segments(prompts_loader: Prompts, predictor, inference_state, final_output: bool = False):
+def get_video_segments(
+    prompts_loader: Prompts, predictor, inference_state, final_output: bool = False
+):
     video_segments: Dict[int, Dict[int, np.ndarray]] = {}
     for batch_prompts in tqdm(prompts_loader, desc="processing prompts\n"):
         predictor.reset_state(inference_state)
         for obj_id, prompt_list in batch_prompts.items():
             for prompt in prompt_list:
                 _, out_obj_ids, out_mask_logits = predictor.add_new_mask(
-                    inference_state=inference_state, frame_idx=prompt[0], obj_id=obj_id, mask=prompt[1]
+                    inference_state=inference_state,
+                    frame_idx=prompt[0],
+                    obj_id=obj_id,
+                    mask=prompt[1],
                 )
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            inference_state
+        ):
             if out_frame_idx not in video_segments:
                 video_segments[out_frame_idx] = {}
             for i, out_obj_id in enumerate(out_obj_ids):
-                video_segments[out_frame_idx][out_obj_id] = (out_mask_logits[i] > 0.0).cpu().numpy()
+                video_segments[out_frame_idx][out_obj_id] = (
+                    (out_mask_logits[i] > 0.0).cpu().numpy()
+                )
 
         if final_output:
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-                inference_state, reverse=True
-            ):
+            for (
+                out_frame_idx,
+                out_obj_ids,
+                out_mask_logits,
+            ) in predictor.propagate_in_video(inference_state, reverse=True):
                 if out_frame_idx not in video_segments:
                     video_segments[out_frame_idx] = {}
                 for i, out_obj_id in enumerate(out_obj_ids):
-                    video_segments[out_frame_idx][out_obj_id] = (out_mask_logits[i] > 0.0).cpu().numpy()
+                    video_segments[out_frame_idx][out_obj_id] = (
+                        (out_mask_logits[i] > 0.0).cpu().numpy()
+                    )
     return video_segments
 
 
@@ -440,6 +524,9 @@ class AutoMaskBatchConfig:
     pred_iou_thresh: float = 0.7
     box_nms_thresh: float = 0.7
     stability_score_thresh: float = 0.85
+    min_mask_region_area: int = 100
+    new_obj_min_area: int = 5000
+    small_obj_area_ratio: float = 0.001
     sam2_checkpoint: str = DEFAULT_SAM2_CKPT
     sam2_config: str = DEFAULT_SAM2_CONFIG
     sam1_checkpoint: str = DEFAULT_SAM1_CKPT
@@ -471,12 +558,18 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
     logger.add(sys.stderr, level="INFO")
     if config.save_outputs:
         os.makedirs(os.path.join(config.output_dir, config.level), exist_ok=True)
-        log_path = config.log_path or os.path.join(config.output_dir, config.level, f"{config.level}.log")
+        log_path = config.log_path or os.path.join(
+            config.output_dir, config.level, f"{config.level}.log"
+        )
         logger.add(log_path, rotation="500 MB")
     elif config.log_path:
         logger.add(config.log_path, rotation="500 MB")
 
-    if device_type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
+    if (
+        device_type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_properties(0).major >= 8
+    ):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
@@ -498,169 +591,267 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
         ]
         frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
         if not frame_names:
-            raise RuntimeError(f"No JPEG frames found in directory: {config.video_path}")
+            raise RuntimeError(
+                f"No JPEG frames found in directory: {config.video_path}"
+            )
         sample_img = cv2.imread(os.path.join(config.video_path, frame_names[0]))
         if sample_img is None:
             raise RuntimeError(f"Failed to read sample frame: {frame_names[0]}")
         frame_height, frame_width = sample_img.shape[:2]
     else:
         frames_root = os.path.join(config.output_dir, config.level, "_frames_tmp")
-        frame_names, fps, (frame_height, frame_width) = extract_video_frames(config.video_path, frames_root)
+        frame_names, fps, (frame_height, frame_width) = extract_video_frames(
+            config.video_path, frames_root
+        )
 
     num_frames = len(frame_names)
 
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        # Allow both package-relative config names (e.g., "configs/sam2/sam2_hiera_l.yaml")
-        # and filesystem paths relative to this module. If a real file path is given,
-        # add its directory to Hydra's search path so compose() can find it.
-        sam2_config = config.sam2_config
-        hydra_overrides_extra: List[str] = []
-        cfg_path = Path(sam2_config).resolve()
-        if cfg_path.is_file():
-            hydra_overrides_extra.append(f"hydra.searchpath=[file://{cfg_path.parent}]")
-            sam2_config = cfg_path.name
-
-        predictor = build_sam2_video_predictor(
-            sam2_config,
-            config.sam2_checkpoint,
-            hydra_overrides_extra=hydra_overrides_extra,
-            device=config.device,
-        )
-        sam = sam_model_registry["vit_h"](checkpoint=config.sam1_checkpoint).to(config.device)
-        mask_generator = SamAutomaticMaskGenerator(
-            model=sam,
-            points_per_side=32,
-            pred_iou_thresh=config.pred_iou_thresh,
-            box_nms_thresh=config.box_nms_thresh,
-            stability_score_thresh=config.stability_score_thresh,
-            crop_n_layers=1,
-            crop_n_points_downscale_factor=1,
-            min_mask_region_area=100,
-        )
-
-        inference_state = predictor.init_state(video_path=frames_root)
-        masks_from_prev: List[np.ndarray] = []
-        now_frame = 0
-        prompts_loader = Prompts(bs=config.batch_size)
-
-        while True:
-            logger.info(f"frame: {now_frame}")
-            sum_id = prompts_loader.get_obj_num()
-            image_path = os.path.join(frames_root, frame_names[now_frame])
-            image = cv2.imread(image_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            try:
-                masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)
-            except IndexError as exc:  # pragma: no cover - hardware dependent
-                logger.error(f"mask_generator.generate IndexError at frame {now_frame}: {exc}")
-                now_frame += 1
-                if now_frame >= len(frame_names):
-                    break
-                continue
-
-            if config.postnms:
-                masks_default, masks_s, masks_m, masks_l = masks_update(
-                    masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5
+        # Ensure no autograd graph is built during inference to reduce memory.
+        with torch.inference_mode():
+            # Allow both package-relative config names (e.g., "configs/sam2/sam2_hiera_l.yaml")
+            # and filesystem paths relative to this module. If a real file path is given,
+            # add its directory to Hydra's search path so compose() can find it.
+            sam2_config = config.sam2_config
+            hydra_overrides_extra: List[str] = []
+            cfg_path = Path(sam2_config).resolve()
+            if cfg_path.is_file():
+                hydra_overrides_extra.append(
+                    f"hydra.searchpath=[file://{cfg_path.parent}]"
                 )
-            if config.level == "default":
-                masks = [mask for mask in masks_default]
-                other_masks = [mask for mask in masks_l] + [mask for mask in masks_m] + [mask for mask in masks_s]
-            elif config.level == "small":
-                masks = [mask for mask in masks_s]
-                other_masks = None
-            elif config.level == "middle":
-                masks = [mask for mask in masks_m]
-                other_masks = [mask for mask in masks_s]
-            elif config.level == "large":
-                masks = [mask for mask in masks_l]
-                other_masks = [mask for mask in masks_s] + [mask for mask in masks_m]
-            else:
-                raise NotImplementedError(f"Unsupported level: {config.level}")
-            if not config.use_other_level:
-                other_masks = None
+                sam2_config = cfg_path.name
 
-            if now_frame == 0:
-                ann_obj_id_list = range(len(masks))
-                if config.save_outputs:
-                    save_masks([masks[ann_obj_id]["segmentation"] for ann_obj_id in ann_obj_id_list], now_frame, os.path.join(config.output_dir, config.level, "mask_each_frame-sam1"))
+            predictor = build_sam2_video_predictor(
+                sam2_config,
+                config.sam2_checkpoint,
+                hydra_overrides_extra=hydra_overrides_extra,
+                device=config.device,
+            )
+            sam = sam_model_registry["vit_h"](checkpoint=config.sam1_checkpoint).to(
+                config.device
+            )
+            mask_generator = SamAutomaticMaskGenerator(
+                model=sam,
+                points_per_side=32,
+                pred_iou_thresh=config.pred_iou_thresh,
+                box_nms_thresh=config.box_nms_thresh,
+                stability_score_thresh=config.stability_score_thresh,
+                crop_n_layers=1,
+                crop_n_points_downscale_factor=1,
+                min_mask_region_area=config.min_mask_region_area,
+            )
 
-                for ann_obj_id in tqdm(ann_obj_id_list):
-                    seg = masks[ann_obj_id]["segmentation"]
-                    prompts_loader.add(ann_obj_id, 0, seg)
-            else:
-                if config.save_outputs:
-                    save_masks([mask["segmentation"] for mask in masks], now_frame, os.path.join(config.output_dir, config.level, "mask_each_frame-sam1"))
-                new_mask_list = search_new_obj(masks_from_prev, masks, other_masks, mask_ratio_thresh)
-                logger.info(f"number of new obj: {len(new_mask_list)}")
+            inference_state = predictor.init_state(
+                video_path=frames_root,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+            )
+            masks_from_prev: List[np.ndarray] = []
+            now_frame = 0
+            prompts_loader = Prompts(bs=config.batch_size)
 
-                for obj_id, mask in enumerate(masks_from_prev):
-                    if mask.sum() == 0:
-                        continue
-                    prompts_loader.add(obj_id, now_frame, mask[0])
-
-                for i in range(len(new_mask_list)):
-                    new_mask = new_mask_list[i]["segmentation"]
-                    prompts_loader.add(sum_id + i, now_frame, new_mask)
-
-            logger.info(f"obj num: {prompts_loader.get_obj_num()}")
-
-            if now_frame == 0 or ("new_mask_list" in locals() and len(new_mask_list) != 0):
-                video_segments = get_video_segments(prompts_loader, predictor, inference_state)
-
-            save_dir = os.path.join(config.output_dir, config.level, "mask_each_frame_sam2")
-            os.makedirs(save_dir, exist_ok=True)
-            os.makedirs(os.path.join(save_dir, f"now_frame_{now_frame}"), exist_ok=True)
-            max_area_no_mask = (0.0, -1)
-            for out_frame_idx in tqdm(range(0, len(frame_names), vis_stride)):
-                if out_frame_idx < now_frame:
+            while True:
+                logger.info(f"frame: {now_frame}")
+                sum_id = prompts_loader.get_obj_num()
+                image_path = os.path.join(frames_root, frame_names[now_frame])
+                image = cv2.imread(image_path)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                try:
+                    masks_default, masks_s, masks_m, masks_l = mask_generator.generate(
+                        image
+                    )
+                except IndexError as exc:  # pragma: no cover - hardware dependent
+                    logger.error(
+                        f"mask_generator.generate IndexError at frame {now_frame}: {exc}"
+                    )
+                    now_frame += 1
+                    if now_frame >= len(frame_names):
+                        break
                     continue
-                out_mask_list = []
-                for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+
+                if config.postnms:
+                    masks_default, masks_s, masks_m, masks_l = masks_update(
+                        masks_default,
+                        masks_s,
+                        masks_m,
+                        masks_l,
+                        iou_thr=0.8,
+                        score_thr=0.7,
+                        inner_thr=0.5,
+                    )
+                if config.level == "default":
+                    masks = [mask for mask in masks_default]
+                    other_masks = (
+                        [mask for mask in masks_l]
+                        + [mask for mask in masks_m]
+                        + [mask for mask in masks_s]
+                    )
+                elif config.level == "small":
+                    masks = [mask for mask in masks_s]
+                    other_masks = None
+                elif config.level == "middle":
+                    masks = [mask for mask in masks_m]
+                    other_masks = [mask for mask in masks_s]
+                elif config.level == "large":
+                    masks = [mask for mask in masks_l]
+                    other_masks = [mask for mask in masks_s] + [mask for mask in masks_m]
+                else:
+                    raise NotImplementedError(f"Unsupported level: {config.level}")
+                if not config.use_other_level:
+                    other_masks = None
+
+                if now_frame == 0:
+                    ann_obj_id_list = range(len(masks))
                     if config.save_outputs:
-                        idx_save_dir = os.path.join(save_dir, f"obj_{out_obj_id:02}")
-                        os.makedirs(idx_save_dir, exist_ok=True)
-                    out_mask_list.append(out_mask)
+                        save_masks(
+                            [
+                                masks[ann_obj_id]["segmentation"]
+                                for ann_obj_id in ann_obj_id_list
+                            ],
+                            now_frame,
+                            os.path.join(
+                                config.output_dir, config.level, "mask_each_frame-sam1"
+                            ),
+                        )
 
-                if not out_mask_list:
-                    continue
-                no_mask_ratio = cal_no_mask_area_ratio(out_mask_list)
-                if now_frame == out_frame_idx:
-                    mask_ratio_thresh = no_mask_ratio
-                    logger.info(f"mask_ratio_thresh: {mask_ratio_thresh}")
+                    for ann_obj_id in tqdm(ann_obj_id_list):
+                        seg = masks[ann_obj_id]["segmentation"]
+                        prompts_loader.add(ann_obj_id, 0, seg)
+                else:
+                    if config.save_outputs:
+                        save_masks(
+                            [mask["segmentation"] for mask in masks],
+                            now_frame,
+                            os.path.join(
+                                config.output_dir, config.level, "mask_each_frame-sam1"
+                            ),
+                        )
+                    new_mask_list = search_new_obj(
+                        masks_from_prev,
+                        masks,
+                        other_masks,
+                        mask_ratio_thresh,
+                        area_threash=config.new_obj_min_area,
+                    )
+                    logger.info(f"number of new obj: {len(new_mask_list)}")
 
-                if config.save_outputs:
-                    fig, ax = plt.subplots(figsize=(6, 4))
-                    ax.set_title(f"frame {out_frame_idx}")
-                    img_path = os.path.join(frames_root, frame_names[out_frame_idx])
-                    ax.imshow(Image.open(img_path))
+                    for obj_id, mask in enumerate(masks_from_prev):
+                        if mask.sum() == 0:
+                            continue
+                        prompts_loader.add(obj_id, now_frame, mask[0])
+
+                    for i in range(len(new_mask_list)):
+                        new_mask = new_mask_list[i]["segmentation"]
+                        prompts_loader.add(sum_id + i, now_frame, new_mask)
+
+                logger.info(f"obj num: {prompts_loader.get_obj_num()}")
+
+                if now_frame == 0 or (
+                    "new_mask_list" in locals() and len(new_mask_list) != 0
+                ):
+                    video_segments = get_video_segments(
+                        prompts_loader, predictor, inference_state
+                    )
+
+                save_dir = os.path.join(
+                    config.output_dir, config.level, "mask_each_frame_sam2"
+                )
+                os.makedirs(save_dir, exist_ok=True)
+                os.makedirs(
+                    os.path.join(save_dir, f"now_frame_{now_frame}"), exist_ok=True
+                )
+                max_area_no_mask = (0.0, -1)
+                for out_frame_idx in tqdm(range(0, len(frame_names), vis_stride)):
+                    if out_frame_idx < now_frame:
+                        continue
+                    out_mask_list = []
                     for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                        show_mask(out_mask, ax, obj_id=out_obj_id, random_color=False)
-                    save_masks(out_mask_list, out_frame_idx, os.path.join(save_dir, f"now_frame_{now_frame}"))
-                    save_masks_npy(out_mask_list, out_frame_idx, os.path.join(save_dir, f"now_frame_{now_frame}"))
-                    plt.savefig(os.path.join(save_dir, f"frame_{out_frame_idx}.png"))
-                    plt.close(fig)
+                        if config.save_outputs:
+                            idx_save_dir = os.path.join(
+                                save_dir, f"obj_{out_obj_id:02}"
+                            )
+                            os.makedirs(idx_save_dir, exist_ok=True)
+                        out_mask_list.append(out_mask)
 
-                if no_mask_ratio > mask_ratio_thresh + config.mask_ratio_tolerance and out_frame_idx > now_frame:
-                    masks_from_prev = out_mask_list
-                    max_area_no_mask = (no_mask_ratio, out_frame_idx)
-                    logger.info(max_area_no_mask)
+                    if not out_mask_list:
+                        continue
+                    no_mask_ratio = cal_no_mask_area_ratio(out_mask_list)
+                    if now_frame == out_frame_idx:
+                        mask_ratio_thresh = no_mask_ratio
+                        logger.info(f"mask_ratio_thresh: {mask_ratio_thresh}")
+
+                    if config.save_outputs:
+                        fig, ax = plt.subplots(figsize=(6, 4))
+                        ax.set_title(f"frame {out_frame_idx}")
+                        img_path = os.path.join(frames_root, frame_names[out_frame_idx])
+                        ax.imshow(Image.open(img_path))
+                        for out_obj_id, out_mask in video_segments[
+                            out_frame_idx
+                        ].items():
+                            show_mask(out_mask, ax, obj_id=out_obj_id, random_color=False)
+                        save_masks(
+                            out_mask_list,
+                            out_frame_idx,
+                            os.path.join(save_dir, f"now_frame_{now_frame}"),
+                        )
+                        save_masks_npy(
+                            out_mask_list,
+                            out_frame_idx,
+                            os.path.join(save_dir, f"now_frame_{now_frame}"),
+                        )
+                        plt.savefig(
+                            os.path.join(save_dir, f"frame_{out_frame_idx}.png")
+                        )
+                        plt.close(fig)
+
+                    if (
+                        no_mask_ratio > mask_ratio_thresh + config.mask_ratio_tolerance
+                        and out_frame_idx > now_frame
+                    ):
+                        masks_from_prev = out_mask_list
+                        max_area_no_mask = (no_mask_ratio, out_frame_idx)
+                        logger.info(max_area_no_mask)
+                        break
+                if max_area_no_mask[1] == -1:
                     break
-            if max_area_no_mask[1] == -1:
-                break
-            logger.info("max_area_no_mask:", max_area_no_mask)
-            now_frame = max_area_no_mask[1]
+                logger.info("max_area_no_mask:", max_area_no_mask)
+                now_frame = max_area_no_mask[1]
 
-        final_save_dir = os.path.join(config.output_dir, config.level, "final-output")
-        video_segments = get_video_segments(prompts_loader, predictor, inference_state, final_output=True)
-        if config.save_outputs:
-            for out_frame_idx in tqdm(range(0, len(frame_names), 1)):
-                out_mask_list = []
-                for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                    out_mask_list.append(out_mask)
-                if not out_mask_list:
-                    continue
-                save_masks(out_mask_list, out_frame_idx, final_save_dir)
-                save_masks_npy(out_mask_list, out_frame_idx, final_save_dir)
+            final_save_dir = os.path.join(
+                config.output_dir, config.level, "final-output"
+            )
+            video_segments = get_video_segments(
+                prompts_loader, predictor, inference_state, final_output=True
+            )
+            if config.save_outputs:
+                for out_frame_idx in tqdm(range(0, len(frame_names), 1)):
+                    out_mask_list = []
+                    for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                        out_mask_list.append(out_mask)
+                    if not out_mask_list:
+                        continue
+                    save_masks(out_mask_list, out_frame_idx, final_save_dir)
+                    save_masks_npy(out_mask_list, out_frame_idx, final_save_dir)
+
+    # Optionally drop tiny objects that never exceed a global area ratio.
+    # This helps treat consistently tiny/false positives as background.
+    area_threshold = config.small_obj_area_ratio * frame_height * frame_width
+    obj_max_area: Dict[int, float] = {}
+    for objs in video_segments.values():
+        for obj_id, mask in objs.items():
+            mask_2d = ensure_2d_mask(mask)
+            area = float(mask_2d.sum())
+            obj_max_area[obj_id] = max(obj_max_area.get(obj_id, 0.0), area)
+
+    tiny_obj_ids = {obj_id for obj_id, area in obj_max_area.items() if area < area_threshold}
+    if tiny_obj_ids:
+        logger.info(
+            f"Removing tiny objects (max per-frame area < {area_threshold:.1f} pixels): {sorted(tiny_obj_ids)}"
+        )
+        for frame_idx, objs in video_segments.items():
+            for obj_id in list(objs.keys()):
+                if obj_id in tiny_obj_ids:
+                    objs.pop(obj_id, None)
 
     # Build dense mask volume (F, H, W) with background=0 and object ids starting at 1.
     mask_volume = np.zeros((num_frames, frame_height, frame_width), dtype=np.int32)
@@ -670,7 +861,11 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             target_id = obj_id + 1  # shift by 1 so background stays 0
             mask_2d = ensure_2d_mask(mask)
             if mask_2d.shape != (frame_height, frame_width):
-                mask_2d = cv2.resize(mask_2d.astype(np.uint8), (frame_width, frame_height), interpolation=cv2.INTER_NEAREST).astype(bool)
+                mask_2d = cv2.resize(
+                    mask_2d.astype(np.uint8),
+                    (frame_width, frame_height),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
             mask_volume[frame_idx][mask_2d] = target_id
             max_obj_id = max(max_obj_id, target_id)
 
@@ -690,10 +885,38 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
         writer.release()
         logger.info(f"colored mask video saved to: {mask_video_path}")
-        
+
         npz_path = os.path.join(config.output_dir, config.level, "mask.npz")
         np.savez_compressed(npz_path, mask_volume=mask_volume)
         logger.info(f"mask volume saved to: {npz_path}")
+
+    # Clean up memory
+    if "predictor" in locals():
+        del predictor
+    if "sam" in locals():
+        del sam
+    if "mask_generator" in locals():
+        del mask_generator
+    if "inference_state" in locals():
+        del inference_state
+    if "video_segments" in locals():
+        del video_segments
+    if "prompts_loader" in locals():
+        del prompts_loader
+
+    plt.close("all")
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     return mask_volume
 

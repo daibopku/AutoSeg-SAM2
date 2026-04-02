@@ -13,11 +13,17 @@ authors = [
 ]
 license = { file = "LICENSE" }
 dependencies = [
-  "torch>=2.3.1",
-  "torchvision>=0.18.1",
-  "segment-anything @ file:submodule/segment-anything-1",
-  "sam-2 @ file:submodule/segment-anything-2",
+  "opencv-python",
+  "matplotlib",
+  "loguru",
+  "numpy",
+  "segment-anything",
+  "sam-2",
 ]
+
+[tool.uv.sources]
+segment-anything = { path = "submodule/segment-anything-1" }
+sam-2 = { path = "submodule/segment-anything-2" }
 
 [project.urls]
 Homepage = "https://github.com/daibopku/AutoSeg-SAM2"
@@ -28,3 +34,5 @@ exclude = ["submodule*", "videos*", "output*", "checkpoints*", "scripts*", "*.eg
 
 [tool.setuptools]
 zip-safe = false
+[tool.uv.pip]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
