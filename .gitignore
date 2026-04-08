@@ -1,4 +1,6 @@
 *.pth
 *.pt
+__pycache__/
+*.py[cod]
 videos/*
 output/
