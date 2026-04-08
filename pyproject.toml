@@ -29,7 +29,7 @@ sam-2 = { path = "submodule/segment-anything-2" }
 Homepage = "https://github.com/daibopku/AutoSeg-SAM2"
 
 [tool.setuptools.packages.find]
-include = ["auto_mask_batch", "auto_mask_batch.*", "sam2", "sam2.*", "sam2_configs", "sam2_configs.*"]
+include = ["auto_mask_batch", "auto_mask_batch.*"]
 exclude = ["submodule*", "videos*", "output*", "checkpoints*", "scripts*", "*.egg-info"]
 
 [tool.setuptools]

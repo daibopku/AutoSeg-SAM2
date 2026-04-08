@@ -27,11 +27,11 @@ Key config parameters mirror the CLI flags from the original script (`batch_size
 pip install /path/to/AutoSeg-SAM2  # or: pip install -e /path/to/AutoSeg-SAM2
 ```
 
-This installs `auto_mask_batch`, bundled `sam2` code, and YAML configs. You still need the model checkpoints in `checkpoints/sam1` and `checkpoints/sam2` at runtime (same relative paths as the defaults, or override in `AutoMaskBatchConfig`).
+Inside this repository layout, the preprocessing pipeline resolves SAM2 from the bundled official `submodule/segment-anything-2` checkout at runtime, not from the old copied `sam2/` tree. Plain `pip install` from outside this repo does not bundle that checkout by itself; keep the repository structure intact (or copy the `segment-anything-2/` tree alongside `auto_mask_batch/`) if you want the same runtime behavior. By default, SAM1 still loads from `checkpoints/sam1`, while SAM 2.1 loads from `submodule/segment-anything-2/checkpoints/` in the official repo layout.
 
 ### Copy-only
 
-If you prefer to copy the folder into another project, copy **both** `auto_mask_batch/`, `sam2/`, and `sam2_configs/`, keep the default relative checkpoint paths, and add the parent directory to `PYTHONPATH`.
+If you prefer to copy the folder into another project, copy **both** `auto_mask_batch/` and `segment-anything-2/`, keep the default relative checkpoint paths, and add the parent directory to `PYTHONPATH`.
 
 ## Outputs
 

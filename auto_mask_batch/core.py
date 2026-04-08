@@ -8,6 +8,7 @@ writes a colorized mask mp4 for convenience.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import gc
@@ -24,14 +25,67 @@ from loguru import logger
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from tqdm import tqdm
 
-from sam2.build_sam import build_sam2_video_predictor
-
-
 MODULE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODULE_DIR.parent
-DEFAULT_SAM2_CKPT = str(PROJECT_ROOT / "checkpoints" / "sam2" / "sam2_hiera_large.pt")
-DEFAULT_SAM2_CONFIG = str(PROJECT_ROOT / "sam2_configs" / "sam2_hiera_l.yaml")
+DEFAULT_SAM2_SOURCE_ROOT = str(PROJECT_ROOT / "submodule" / "segment-anything-2")
+DEFAULT_SAM2_CKPT = str(
+    Path(DEFAULT_SAM2_SOURCE_ROOT) / "checkpoints" / "sam2.1_hiera_large.pt"
+)
+DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_SAM1_CKPT = str(PROJECT_ROOT / "checkpoints" / "sam1" / "sam_vit_h_4b8939.pth")
+
+
+def load_official_sam2_modules(source_root: str):
+    source_root_path = Path(source_root).resolve()
+    sam2_root = source_root_path / "sam2"
+    build_sam_path = sam2_root / "build_sam.py"
+    predictor_path = sam2_root / "sam2_video_predictor.py"
+
+    if not build_sam_path.is_file() or not predictor_path.is_file():
+        raise FileNotFoundError(
+            f"Official SAM2 source files not found under {source_root_path}"
+        )
+
+    if str(source_root_path) not in sys.path:
+        sys.path.insert(0, str(source_root_path))
+
+    for module_name in list(sys.modules):
+        if module_name == "sam2" or module_name.startswith("sam2."):
+            sys.modules.pop(module_name, None)
+
+    try:
+        sam2_pkg = importlib.import_module("sam2")
+        build_sam_module = importlib.import_module("sam2.build_sam")
+        predictor_module = importlib.import_module("sam2.sam2_video_predictor")
+    except Exception:
+        for module_name in ["sam2.build_sam", "sam2.sam2_video_predictor", "sam2"]:
+            sys.modules.pop(module_name, None)
+        raise
+
+    for module in (sam2_pkg, build_sam_module, predictor_module):
+        module_path = Path(module.__file__).resolve()
+        if source_root_path not in module_path.parents:
+            raise RuntimeError(
+                f"SAM2 import resolved to unexpected path: {module_path}"
+            )
+
+    return build_sam_module, predictor_module
+
+
+def resolve_sam2_config_name(source_root: str, sam2_config: str) -> str:
+    config_path = Path(sam2_config)
+    if not config_path.exists():
+        return sam2_config
+
+    source_root_path = Path(source_root).resolve()
+    sam2_root = source_root_path / "sam2"
+    config_path = config_path.resolve()
+    try:
+        return config_path.relative_to(sam2_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"SAM2 config path must live under {sam2_root}, got {config_path}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -414,98 +468,43 @@ def ensure_2d_mask(mask: np.ndarray) -> np.ndarray:
     return mask_arr.astype(bool)
 
 
-class Prompts:
-    def __init__(self, bs: int):
-        self.batch_size = bs
-        self.prompts = {}
-        self.obj_list: List[int] = []
-        self.key_frame_list: List[int] = []
-        self.key_frame_obj_begin_list: List[int] = []
-
-    def add(self, obj_id, frame_id, mask):
-        if obj_id not in self.obj_list:
-            new_obj = True
-            self.prompts[obj_id] = []
-            self.obj_list.append(obj_id)
-        else:
-            new_obj = False
-        self.prompts[obj_id].append((frame_id, mask))
-        if frame_id not in self.key_frame_list and new_obj:
-            self.key_frame_list.append(frame_id)
-            self.key_frame_obj_begin_list.append(obj_id)
-            logger.info("key_frame_obj_begin_list:", self.key_frame_obj_begin_list)
-
-    def get_obj_num(self):
-        return len(self.obj_list)
-
-    def __len__(self):
-        if self.obj_list % self.batch_size == 0:  # type: ignore[arg-type]
-            return len(self.obj_list) // self.batch_size
-        return len(self.obj_list) // self.batch_size + 1
-
-    def __iter__(self):
-        self.start_idx = 0
-        self.iter_frameindex = 0
-        return self
-
-    def __next__(self):
-        if self.start_idx < len(self.obj_list):
-            if self.iter_frameindex == len(self.key_frame_list) - 1:
-                end_idx = min(self.start_idx + self.batch_size, len(self.obj_list))
-            else:
-                if (
-                    self.start_idx + self.batch_size
-                    < self.key_frame_obj_begin_list[self.iter_frameindex + 1]
-                ):
-                    end_idx = self.start_idx + self.batch_size
-                else:
-                    end_idx = self.key_frame_obj_begin_list[self.iter_frameindex + 1]
-                    self.iter_frameindex += 1
-            batch_keys = self.obj_list[self.start_idx : end_idx]
-            batch_prompts = {key: self.prompts[key] for key in batch_keys}
-            self.start_idx = end_idx
-            return batch_prompts
-        raise StopIteration
+VideoSegments = Dict[int, Dict[int, np.ndarray]]
 
 
-def get_video_segments(
-    prompts_loader: Prompts, predictor, inference_state, final_output: bool = False
-):
-    video_segments: Dict[int, Dict[int, np.ndarray]] = {}
-    for batch_prompts in tqdm(prompts_loader, desc="processing prompts\n"):
-        predictor.reset_state(inference_state)
-        for obj_id, prompt_list in batch_prompts.items():
-            for prompt in prompt_list:
-                _, out_obj_ids, out_mask_logits = predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=prompt[0],
-                    obj_id=obj_id,
-                    mask=prompt[1],
-                )
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-            inference_state
-        ):
-            if out_frame_idx not in video_segments:
-                video_segments[out_frame_idx] = {}
-            for i, out_obj_id in enumerate(out_obj_ids):
-                video_segments[out_frame_idx][out_obj_id] = (
-                    (out_mask_logits[i] > 0.0).cpu().numpy()
-                )
+def merge_video_segments(
+    existing: VideoSegments, update: VideoSegments, *, in_place: bool = False
+) -> VideoSegments:
+    target: VideoSegments
+    if in_place:
+        target = existing
+    else:
+        target = {frame_idx: dict(objs) for frame_idx, objs in existing.items()}
+    for frame_idx, objs in update.items():
+        frame_slot = target.setdefault(frame_idx, {})
+        for obj_id, mask in objs.items():
+            frame_slot[obj_id] = mask
+    return target
 
-        if final_output:
-            for (
-                out_frame_idx,
-                out_obj_ids,
-                out_mask_logits,
-            ) in predictor.propagate_in_video(inference_state, reverse=True):
-                if out_frame_idx not in video_segments:
-                    video_segments[out_frame_idx] = {}
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    video_segments[out_frame_idx][out_obj_id] = (
-                        (out_mask_logits[i] > 0.0).cpu().numpy()
-                    )
+
+def propagate_from_state(
+    predictor,
+    inference_state,
+    reverse: bool = False,
+    start_frame_idx: Optional[int] = None,
+    max_frame_num_to_track: Optional[int] = None,
+) -> VideoSegments:
+    video_segments: VideoSegments = {}
+    propagate_kwargs = {"reverse": reverse}
+    if start_frame_idx is not None:
+        propagate_kwargs["start_frame_idx"] = start_frame_idx
+    if max_frame_num_to_track is not None:
+        propagate_kwargs["max_frame_num_to_track"] = max_frame_num_to_track
+    iterator = predictor.propagate_in_video(inference_state, **propagate_kwargs)
+    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+        frame_slot = video_segments.setdefault(out_frame_idx, {})
+        for i, out_obj_id in enumerate(out_obj_ids):
+            frame_slot[out_obj_id] = (out_mask_logits[i] > 0.0).cpu().numpy()
     return video_segments
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -517,7 +516,7 @@ class AutoMaskBatchConfig:
     video_path: str
     output_dir: str
     level: str = "default"  # one of {"default", "small", "middle", "large"}
-    batch_size: int = 20
+    batch_size: int = 20  # legacy no-op kept for CLI/backward compatibility
     detect_stride: int = 10
     use_other_level: bool = True
     postnms: bool = True
@@ -527,8 +526,10 @@ class AutoMaskBatchConfig:
     min_mask_region_area: int = 100
     new_obj_min_area: int = 5000
     small_obj_area_ratio: float = 0.001
+    sam2_source_root: str = DEFAULT_SAM2_SOURCE_ROOT
     sam2_checkpoint: str = DEFAULT_SAM2_CKPT
     sam2_config: str = DEFAULT_SAM2_CONFIG
+    vos_optimized: bool = False
     sam1_checkpoint: str = DEFAULT_SAM1_CKPT
     device: str = "cuda"
     log_path: Optional[str] = None
@@ -537,7 +538,37 @@ class AutoMaskBatchConfig:
     mask_ratio_tolerance: float = 0.01
 
 
-VideoSegments = Dict[int, Dict[int, np.ndarray]]
+def build_video_predictor_and_state(
+    build_sam_module, config: AutoMaskBatchConfig, frames_root: str
+):
+    sam2_config = resolve_sam2_config_name(config.sam2_source_root, config.sam2_config)
+    predictor = build_sam_module.build_sam2_video_predictor(
+        sam2_config,
+        config.sam2_checkpoint,
+        device=config.device,
+        vos_optimized=config.vos_optimized,
+    )
+    inference_state = predictor.init_state(
+        video_path=frames_root,
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+    )
+    return predictor, inference_state
+
+
+def add_masks_to_state(
+    predictor,
+    inference_state,
+    frame_idx: int,
+    masks_by_obj: Dict[int, np.ndarray],
+) -> None:
+    for obj_id, mask in masks_by_obj.items():
+        predictor.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
+        )
 
 
 def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
@@ -553,9 +584,14 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
 
     device_type = "cuda" if config.device.startswith("cuda") else "cpu"
     vis_stride = config.vis_stride or config.detect_stride
+    build_sam_module, _ = load_official_sam2_modules(config.sam2_source_root)
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
+    if config.batch_size != 20:
+        logger.info(
+            f"batch_size={config.batch_size} is a legacy compatibility option and is ignored by the incremental SAM2 path"
+        )
     if config.save_outputs:
         os.makedirs(os.path.join(config.output_dir, config.level), exist_ok=True)
         log_path = config.log_path or os.path.join(
@@ -609,23 +645,8 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
         # Ensure no autograd graph is built during inference to reduce memory.
         with torch.inference_mode():
-            # Allow both package-relative config names (e.g., "configs/sam2/sam2_hiera_l.yaml")
-            # and filesystem paths relative to this module. If a real file path is given,
-            # add its directory to Hydra's search path so compose() can find it.
-            sam2_config = config.sam2_config
-            hydra_overrides_extra: List[str] = []
-            cfg_path = Path(sam2_config).resolve()
-            if cfg_path.is_file():
-                hydra_overrides_extra.append(
-                    f"hydra.searchpath=[file://{cfg_path.parent}]"
-                )
-                sam2_config = cfg_path.name
-
-            predictor = build_sam2_video_predictor(
-                sam2_config,
-                config.sam2_checkpoint,
-                hydra_overrides_extra=hydra_overrides_extra,
-                device=config.device,
+            predictor, inference_state = build_video_predictor_and_state(
+                build_sam_module, config, frames_root
             )
             sam = sam_model_registry["vit_h"](checkpoint=config.sam1_checkpoint).to(
                 config.device
@@ -641,18 +662,12 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
                 min_mask_region_area=config.min_mask_region_area,
             )
 
-            inference_state = predictor.init_state(
-                video_path=frames_root,
-                offload_video_to_cpu=True,
-                offload_state_to_cpu=True,
-            )
             masks_from_prev: List[np.ndarray] = []
             now_frame = 0
-            prompts_loader = Prompts(bs=config.batch_size)
+            next_obj_id = 0
 
             while True:
                 logger.info(f"frame: {now_frame}")
-                sum_id = prompts_loader.get_obj_num()
                 image_path = os.path.join(frames_root, frame_names[now_frame])
                 image = cv2.imread(image_path)
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -716,7 +731,22 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
 
                     for ann_obj_id in tqdm(ann_obj_id_list):
                         seg = masks[ann_obj_id]["segmentation"]
-                        prompts_loader.add(ann_obj_id, 0, seg)
+                        add_masks_to_state(
+                            predictor,
+                            inference_state,
+                            frame_idx=0,
+                            masks_by_obj={ann_obj_id: seg},
+                        )
+                    next_obj_id = len(masks)
+                    merge_video_segments(
+                        video_segments,
+                        propagate_from_state(
+                            predictor,
+                            inference_state,
+                            start_frame_idx=0,
+                        ),
+                        in_place=True,
+                    )
                 else:
                     if config.save_outputs:
                         save_masks(
@@ -735,37 +765,66 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
                     )
                     logger.info(f"number of new obj: {len(new_mask_list)}")
 
-                    for obj_id, mask in enumerate(masks_from_prev):
-                        if mask.sum() == 0:
-                            continue
-                        prompts_loader.add(obj_id, now_frame, mask[0])
+                    if new_mask_list:
+                        existing_masks_by_obj = {
+                            obj_id: mask[0]
+                            for obj_id, mask in enumerate(masks_from_prev)
+                            if np.asarray(mask).sum() > 0
+                        }
+                        new_masks_by_obj = {
+                            next_obj_id + i: new_mask["segmentation"]
+                            for i, new_mask in enumerate(new_mask_list)
+                        }
+                        current_frame_masks = dict(existing_masks_by_obj)
+                        current_frame_masks.update(new_masks_by_obj)
+                        add_masks_to_state(
+                            predictor,
+                            inference_state,
+                            frame_idx=now_frame,
+                            masks_by_obj=current_frame_masks,
+                        )
+                        next_obj_id += len(new_masks_by_obj)
+                        merge_video_segments(
+                            video_segments,
+                            propagate_from_state(
+                                predictor,
+                                inference_state,
+                                start_frame_idx=now_frame,
+                            ),
+                            in_place=True,
+                        )
+                        merge_video_segments(
+                            video_segments,
+                            propagate_from_state(
+                                predictor,
+                                inference_state,
+                                start_frame_idx=now_frame,
+                                reverse=True,
+                            ),
+                            in_place=True,
+                        )
 
-                    for i in range(len(new_mask_list)):
-                        new_mask = new_mask_list[i]["segmentation"]
-                        prompts_loader.add(sum_id + i, now_frame, new_mask)
+                logger.info(f"obj num: {next_obj_id}")
 
-                logger.info(f"obj num: {prompts_loader.get_obj_num()}")
+                if not video_segments:
+                    raise RuntimeError("No video segments were generated from SAM2 state")
 
-                if now_frame == 0 or (
-                    "new_mask_list" in locals() and len(new_mask_list) != 0
-                ):
-                    video_segments = get_video_segments(
-                        prompts_loader, predictor, inference_state
+                if config.save_outputs:
+                    save_dir = os.path.join(
+                        config.output_dir, config.level, "mask_each_frame_sam2"
                     )
-
-                save_dir = os.path.join(
-                    config.output_dir, config.level, "mask_each_frame_sam2"
-                )
-                os.makedirs(save_dir, exist_ok=True)
-                os.makedirs(
-                    os.path.join(save_dir, f"now_frame_{now_frame}"), exist_ok=True
-                )
+                    os.makedirs(save_dir, exist_ok=True)
+                    os.makedirs(
+                        os.path.join(save_dir, f"now_frame_{now_frame}"), exist_ok=True
+                    )
                 max_area_no_mask = (0.0, -1)
                 for out_frame_idx in tqdm(range(0, len(frame_names), vis_stride)):
                     if out_frame_idx < now_frame:
                         continue
                     out_mask_list = []
-                    for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                    for out_obj_id, out_mask in video_segments.get(
+                        out_frame_idx, {}
+                    ).items():
                         if config.save_outputs:
                             idx_save_dir = os.path.join(
                                 save_dir, f"obj_{out_obj_id:02}"
@@ -820,13 +879,12 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             final_save_dir = os.path.join(
                 config.output_dir, config.level, "final-output"
             )
-            video_segments = get_video_segments(
-                prompts_loader, predictor, inference_state, final_output=True
-            )
             if config.save_outputs:
                 for out_frame_idx in tqdm(range(0, len(frame_names), 1)):
                     out_mask_list = []
-                    for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                    for out_obj_id, out_mask in video_segments.get(
+                        out_frame_idx, {}
+                    ).items():
                         out_mask_list.append(out_mask)
                     if not out_mask_list:
                         continue
