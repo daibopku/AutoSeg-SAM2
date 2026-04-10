@@ -13,6 +13,7 @@ import os
 import sys
 import gc
 from dataclasses import dataclass
+from importlib.machinery import PathFinder
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -35,7 +36,78 @@ DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_SAM1_CKPT = str(PROJECT_ROOT / "checkpoints" / "sam1" / "sam_vit_h_4b8939.pth")
 
 
-def load_official_sam2_modules(source_root: str):
+def _clear_sam2_modules() -> None:
+    for module_name in list(sys.modules):
+        if module_name == "sam2" or module_name.startswith("sam2."):
+            sys.modules.pop(module_name, None)
+
+
+def _import_sam2_modules() -> Tuple[object, object, object]:
+    try:
+        sam2_pkg = importlib.import_module("sam2")
+        build_sam_module = importlib.import_module("sam2.build_sam")
+        predictor_module = importlib.import_module("sam2.sam2_video_predictor")
+    except Exception:
+        for module_name in ["sam2.build_sam", "sam2.sam2_video_predictor", "sam2"]:
+            sys.modules.pop(module_name, None)
+        raise
+    return sam2_pkg, build_sam_module, predictor_module
+
+
+def _load_installed_sam2_modules():
+    project_root = PROJECT_ROOT.resolve()
+    candidates = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            entry_path = Path(entry).resolve()
+        except OSError:
+            continue
+        if entry_path == project_root or project_root in entry_path.parents:
+            continue
+        spec = PathFinder.find_spec("sam2", [str(entry_path)])
+        if spec is None or spec.origin is None:
+            continue
+        spec_origin = Path(spec.origin).resolve()
+        if project_root in spec_origin.parents:
+            continue
+        priority = 0 if {"site-packages", "dist-packages"} & set(entry_path.parts) else 1
+        candidates.append((priority, entry_path))
+
+    installed_parent = min(candidates, default=(None, None))[1]
+
+    if installed_parent is None:
+        raise ImportError("Installed sam2 package not found on sys.path")
+
+    original_sys_path = list(sys.path)
+    sys.path[:] = [str(installed_parent)] + [
+        path
+        for path in original_sys_path
+        if Path(path or ".").resolve() != installed_parent
+        and Path(path or ".").resolve() != project_root
+        and project_root not in Path(path or ".").resolve().parents
+    ]
+    _clear_sam2_modules()
+    try:
+        modules = _import_sam2_modules()
+    finally:
+        sys.path[:] = original_sys_path
+
+    return modules
+
+
+def load_official_sam2_modules(source_root: Optional[str] = None):
+    if source_root is None:
+        sam2_pkg, build_sam_module, predictor_module = _load_installed_sam2_modules()
+        for module in (sam2_pkg, build_sam_module, predictor_module):
+            module_path = Path(module.__file__).resolve()
+            if PROJECT_ROOT.resolve() in module_path.parents:
+                raise RuntimeError(
+                    f"SAM2 import unexpectedly resolved to project source: {module_path}"
+                )
+        return build_sam_module, predictor_module
+
     source_root_path = Path(source_root).resolve()
     sam2_root = source_root_path / "sam2"
     build_sam_path = sam2_root / "build_sam.py"
@@ -49,18 +121,8 @@ def load_official_sam2_modules(source_root: str):
     if str(source_root_path) not in sys.path:
         sys.path.insert(0, str(source_root_path))
 
-    for module_name in list(sys.modules):
-        if module_name == "sam2" or module_name.startswith("sam2."):
-            sys.modules.pop(module_name, None)
-
-    try:
-        sam2_pkg = importlib.import_module("sam2")
-        build_sam_module = importlib.import_module("sam2.build_sam")
-        predictor_module = importlib.import_module("sam2.sam2_video_predictor")
-    except Exception:
-        for module_name in ["sam2.build_sam", "sam2.sam2_video_predictor", "sam2"]:
-            sys.modules.pop(module_name, None)
-        raise
+    _clear_sam2_modules()
+    sam2_pkg, build_sam_module, predictor_module = _import_sam2_modules()
 
     for module in (sam2_pkg, build_sam_module, predictor_module):
         module_path = Path(module.__file__).resolve()
@@ -72,13 +134,21 @@ def load_official_sam2_modules(source_root: str):
     return build_sam_module, predictor_module
 
 
-def resolve_sam2_config_name(source_root: str, sam2_config: str) -> str:
+def resolve_sam2_config_name(source_root: Optional[str], sam2_config: str) -> str:
     config_path = Path(sam2_config)
     if not config_path.exists():
         return sam2_config
 
-    source_root_path = Path(source_root).resolve()
-    sam2_root = source_root_path / "sam2"
+    if source_root is None:
+        try:
+            sam2_pkg = importlib.import_module("sam2")
+        except Exception:
+            return sam2_config
+        sam2_root = Path(sam2_pkg.__file__).resolve().parent
+    else:
+        source_root_path = Path(source_root).resolve()
+        sam2_root = source_root_path / "sam2"
+
     config_path = config_path.resolve()
     try:
         return config_path.relative_to(sam2_root).as_posix()
@@ -86,6 +156,14 @@ def resolve_sam2_config_name(source_root: str, sam2_config: str) -> str:
         raise ValueError(
             f"SAM2 config path must live under {sam2_root}, got {config_path}"
         ) from exc
+
+
+def sam2_compiled_extension_available() -> bool:
+    try:
+        importlib.import_module("sam2._C")
+    except Exception:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +477,24 @@ def cal_no_mask_area_ratio(out_mask_list: List[np.ndarray]):
     return mask_none.sum() / (h * w)
 
 
+def iter_detection_check_frames(num_frames: int, vis_stride: int) -> Tuple[int, ...]:
+    """Return frames to inspect for new-object triggers.
+
+    The main search still samples by ``vis_stride`` for efficiency, but the tail
+    after the last stride-aligned sample is scanned densely so objects appearing
+    near the end of the video are not skipped.
+    """
+
+    if num_frames <= 0:
+        return ()
+
+    frames = list(range(0, num_frames, max(vis_stride, 1)))
+    last_sampled = frames[-1]
+    if last_sampled < num_frames - 1:
+        frames.extend(range(last_sampled + 1, num_frames))
+    return tuple(frames)
+
+
 def extract_video_frames(
     video_path: str, dst_dir: str
 ) -> Tuple[List[str], float, Tuple[int, int]]:
@@ -516,9 +612,10 @@ class AutoMaskBatchConfig:
     video_path: str
     output_dir: str
     level: str = "default"  # one of {"default", "small", "middle", "large"}
-    batch_size: int = 20  # legacy no-op kept for CLI/backward compatibility
+    batch_size: int = 20  # used only by the legacy reset/replay flow
     detect_stride: int = 10
     use_other_level: bool = True
+    use_legacy_reset_flow: bool = False
     postnms: bool = True
     pred_iou_thresh: float = 0.7
     box_nms_thresh: float = 0.7
@@ -526,7 +623,7 @@ class AutoMaskBatchConfig:
     min_mask_region_area: int = 100
     new_obj_min_area: int = 5000
     small_obj_area_ratio: float = 0.001
-    sam2_source_root: str = DEFAULT_SAM2_SOURCE_ROOT
+    sam2_source_root: Optional[str] = None
     sam2_checkpoint: str = DEFAULT_SAM2_CKPT
     sam2_config: str = DEFAULT_SAM2_CONFIG
     vos_optimized: bool = False
@@ -538,15 +635,98 @@ class AutoMaskBatchConfig:
     mask_ratio_tolerance: float = 0.01
 
 
+class Prompts:
+    def __init__(self, bs: int):
+        self.batch_size = bs
+        self.prompts: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+        self.obj_list: List[int] = []
+        self.key_frame_list: List[int] = []
+        self.key_frame_obj_begin_list: List[int] = []
+
+    def add(self, obj_id: int, frame_id: int, mask: np.ndarray):
+        if obj_id not in self.obj_list:
+            new_obj = True
+            self.prompts[obj_id] = []
+            self.obj_list.append(obj_id)
+        else:
+            new_obj = False
+        self.prompts[obj_id].append((frame_id, mask))
+        if frame_id not in self.key_frame_list and new_obj:
+            self.key_frame_list.append(frame_id)
+            self.key_frame_obj_begin_list.append(obj_id)
+
+    def get_obj_num(self):
+        return len(self.obj_list)
+
+    def __iter__(self):
+        self.start_idx = 0
+        self.iter_frameindex = 0
+        return self
+
+    def __next__(self):
+        if self.start_idx >= len(self.obj_list):
+            raise StopIteration
+        if self.iter_frameindex == len(self.key_frame_list) - 1:
+            end_idx = min(self.start_idx + self.batch_size, len(self.obj_list))
+        else:
+            next_begin = self.key_frame_obj_begin_list[self.iter_frameindex + 1]
+            if self.start_idx + self.batch_size < next_begin:
+                end_idx = self.start_idx + self.batch_size
+            else:
+                end_idx = next_begin
+                self.iter_frameindex += 1
+        batch_keys = self.obj_list[self.start_idx : end_idx]
+        batch_prompts = {key: self.prompts[key] for key in batch_keys}
+        self.start_idx = end_idx
+        return batch_prompts
+
+
+def get_video_segments(
+    prompts_loader: Prompts,
+    predictor,
+    inference_state,
+    *,
+    final_output: bool = False,
+) -> VideoSegments:
+    video_segments: VideoSegments = {}
+    for batch_prompts in tqdm(prompts_loader, desc="processing prompts\n"):
+        predictor.reset_state(inference_state)
+        for obj_id, prompt_list in batch_prompts.items():
+            for frame_idx, mask in prompt_list:
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    mask=mask,
+                )
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+            inference_state
+        ):
+            frame_slot = video_segments.setdefault(out_frame_idx, {})
+            for i, out_obj_id in enumerate(out_obj_ids):
+                frame_slot[out_obj_id] = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+        if final_output:
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state, reverse=True
+            ):
+                frame_slot = video_segments.setdefault(out_frame_idx, {})
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    frame_slot[out_obj_id] = (out_mask_logits[i] > 0.0).cpu().numpy()
+    return video_segments
+
+
 def build_video_predictor_and_state(
     build_sam_module, config: AutoMaskBatchConfig, frames_root: str
 ):
     sam2_config = resolve_sam2_config_name(config.sam2_source_root, config.sam2_config)
+    apply_postprocessing = sam2_compiled_extension_available()
     predictor = build_sam_module.build_sam2_video_predictor(
         sam2_config,
         config.sam2_checkpoint,
         device=config.device,
         vos_optimized=config.vos_optimized,
+        apply_postprocessing=apply_postprocessing,
     )
     inference_state = predictor.init_state(
         video_path=frames_root,
@@ -588,7 +768,7 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
-    if config.batch_size != 20:
+    if config.batch_size != 20 and not config.use_legacy_reset_flow:
         logger.info(
             f"batch_size={config.batch_size} is a legacy compatibility option and is ignored by the incremental SAM2 path"
         )
@@ -665,6 +845,9 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             masks_from_prev: List[np.ndarray] = []
             now_frame = 0
             next_obj_id = 0
+            prompts_loader = (
+                Prompts(bs=config.batch_size) if config.use_legacy_reset_flow else None
+            )
 
             while True:
                 logger.info(f"frame: {now_frame}")
@@ -729,24 +912,36 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
                             ),
                         )
 
-                    for ann_obj_id in tqdm(ann_obj_id_list):
-                        seg = masks[ann_obj_id]["segmentation"]
-                        add_masks_to_state(
+                    if config.use_legacy_reset_flow:
+                        assert prompts_loader is not None
+                        for ann_obj_id in tqdm(ann_obj_id_list):
+                            seg = masks[ann_obj_id]["segmentation"]
+                            prompts_loader.add(ann_obj_id, 0, seg)
+                        next_obj_id = prompts_loader.get_obj_num()
+                        video_segments = get_video_segments(
+                            prompts_loader,
                             predictor,
                             inference_state,
-                            frame_idx=0,
-                            masks_by_obj={ann_obj_id: seg},
                         )
-                    next_obj_id = len(masks)
-                    merge_video_segments(
-                        video_segments,
-                        propagate_from_state(
-                            predictor,
-                            inference_state,
-                            start_frame_idx=0,
-                        ),
-                        in_place=True,
-                    )
+                    else:
+                        for ann_obj_id in tqdm(ann_obj_id_list):
+                            seg = masks[ann_obj_id]["segmentation"]
+                            add_masks_to_state(
+                                predictor,
+                                inference_state,
+                                frame_idx=0,
+                                masks_by_obj={ann_obj_id: seg},
+                            )
+                        next_obj_id = len(masks)
+                        merge_video_segments(
+                            video_segments,
+                            propagate_from_state(
+                                predictor,
+                                inference_state,
+                                start_frame_idx=0,
+                            ),
+                            in_place=True,
+                        )
                 else:
                     if config.save_outputs:
                         save_masks(
@@ -765,7 +960,23 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
                     )
                     logger.info(f"number of new obj: {len(new_mask_list)}")
 
-                    if new_mask_list:
+                    if config.use_legacy_reset_flow:
+                        assert prompts_loader is not None
+                        if now_frame == 0 or new_mask_list:
+                            sum_id = prompts_loader.get_obj_num()
+                            for obj_id, mask in enumerate(masks_from_prev):
+                                if np.asarray(mask).sum() == 0:
+                                    continue
+                                prompts_loader.add(obj_id, now_frame, mask[0])
+                            for i, new_mask in enumerate(new_mask_list):
+                                prompts_loader.add(sum_id + i, now_frame, new_mask["segmentation"])
+                            next_obj_id = prompts_loader.get_obj_num()
+                            video_segments = get_video_segments(
+                                prompts_loader,
+                                predictor,
+                                inference_state,
+                            )
+                    elif new_mask_list:
                         existing_masks_by_obj = {
                             obj_id: mask[0]
                             for obj_id, mask in enumerate(masks_from_prev)
@@ -818,7 +1029,8 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
                         os.path.join(save_dir, f"now_frame_{now_frame}"), exist_ok=True
                     )
                 max_area_no_mask = (0.0, -1)
-                for out_frame_idx in tqdm(range(0, len(frame_names), vis_stride)):
+                check_frames = iter_detection_check_frames(len(frame_names), vis_stride)
+                for out_frame_idx in tqdm(check_frames):
                     if out_frame_idx < now_frame:
                         continue
                     out_mask_list = []
@@ -879,6 +1091,14 @@ def run_auto_mask_batch(config: AutoMaskBatchConfig) -> np.ndarray:
             final_save_dir = os.path.join(
                 config.output_dir, config.level, "final-output"
             )
+            if config.use_legacy_reset_flow:
+                assert prompts_loader is not None
+                video_segments = get_video_segments(
+                    prompts_loader,
+                    predictor,
+                    inference_state,
+                    final_output=True,
+                )
             if config.save_outputs:
                 for out_frame_idx in tqdm(range(0, len(frame_names), 1)):
                     out_mask_list = []
